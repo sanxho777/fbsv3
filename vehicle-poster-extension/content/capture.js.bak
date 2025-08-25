@@ -1,369 +1,228 @@
-(function(){
-  const BRIDGE = "http://127.0.0.1:5566";
-  // --- UI ---
-  const root=document.createElement("div");
-  root.id="vp-root";
-  root.innerHTML=`
-    <button id="vp-pill" title="Vehicle Poster">Capture Vehicle</button>
-    <div id="vp-panel">
-      <h2>Vehicle Preview</h2>
-      <div id="vp-content"></div>
-      <div class="vp-actions">
-        <button id="vp-copy">Copy JSON</button>
-        <button id="vp-images">Download Images</button>
-        <button id="vp-send" class="primary">Send to Node</button>
+(() => {
+  if (window.__vpHardBoot) return; window.__vpHardBoot = true;
+  console.debug("[VP] v4 loaded");
+
+  /* ========== utils ========== */
+  const $ = (sel, root=document) => root.querySelector(sel);
+  const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+  const txt = el => (el?.textContent || "").trim();
+  const toNum = s => { const m = String(s||"").match(/\d+/g); return m ? Number(m.join("")) : null; };
+  const norm = s => String(s||"").toLowerCase().replace(/\s+/g," ").replace(/[^\p{L}\p{N} ]+/gu,"").trim();
+
+  /* ========== dt/dd readers (very permissive) ========== */
+  function ddByLabels(labels) {
+    const wanted = labels.map(norm);
+    for (const dt of $$("dt")) {
+      const label = norm(txt(dt));
+      if (wanted.includes(label)) {
+        const dd = dt.nextElementSibling;
+        if (dd && dd.tagName?.toLowerCase() === "dd") return txt(dd);
+      }
+    }
+    return "";
+  }
+
+  /* fallback: look inside â€œVehicle Previewâ€ side box (Cars.com) */
+  function valueNearLabel(labels) {
+    const wanted = new Set(labels.map(norm));
+    for (const row of $$("tr,li,div")) {
+      const s = norm(txt(row));
+      for (const w of wanted) {
+        if (s.startsWith(w + " ")) {
+          // try to take the tail part (after label)
+          const tail = txt(row).replace(new RegExp("^\\s*" + w + "\\s*:?\\s*", "i"), "");
+          if (tail) return tail;
+        }
+      }
+    }
+    return "";
+  }
+
+  /* ========== Cars.com readers ========== */
+  function getHeaderPrice(){
+    const node = $('[data-qa="primary-price"].primary-price') ||
+                 $$("[class*='price']").find(n => /\$\s*\d/.test(txt(n)));
+    const price = toNum(txt(node));
+    return Number.isFinite(price) ? price : null;
+  }
+
+  function getHeaderMiles(){
+    const a = toNum(txt($(".listing-mileage")));
+    if (Number.isFinite(a)) return a;
+    const b = toNum(ddByLabels(["Mileage"]));
+    if (Number.isFinite(b)) return b;
+    const c = toNum(valueNearLabel(["mileage"]));
+    return Number.isFinite(c) ? c : null;
+  }
+
+  function getTitle(){
+    return txt($(".listing-title")) || txt($(".sticky-header-listing-title")) || txt($("h1"));
+  }
+
+  function parseYMMT(title){
+    let year=null, make="", model="", trim="";
+    if (title) {
+      const y = title.match(/\b(19|20)\d{2}\b/); if (y) year = +y[0];
+      const afterYear = title.replace(/^\s*(?:Used\s+)?\d{4}\s+/, "");
+      const parts = afterYear.split(/\s+/);
+      make = parts.shift() || "";
+      const rest = parts.join(" ").trim();
+      const rp = rest.split(/\s+/);
+      model = rp.shift() || "";
+      trim = rp.join(" ").trim();
+    }
+    return {year, make, model, trim};
+  }
+
+  function readAny(selArr){ for (const s of selArr){ const v = txt($(s)); if (v) return v } return "" }
+
+  function captureCars(){
+    const title = getTitle();
+    const price = getHeaderPrice();
+    const mileage = getHeaderMiles();
+    const {year, make, model, trim} = parseYMMT(title);
+
+    const exterior = ddByLabels(["Exterior color","Exterior"]) ||
+                     readAny(['[data-qa*="exterior"]','[data-qa="exterior-color"]']) ||
+                     valueNearLabel(["exterior","exterior color"]);
+
+    const interior = ddByLabels(["Interior color","Interior"]) ||
+                     readAny(['[data-qa*="interior"]','[data-qa="interior-color"]']) ||
+                     valueNearLabel(["interior","interior color"]);
+
+    const drivetrain   = ddByLabels(["Drivetrain"])   || readAny(['[data-qa*="drivetrain"]']);
+    const transmission = ddByLabels(["Transmission"]) || readAny(['[data-qa*="transmission"]']);
+    const engine       = ddByLabels(["Engine"])       || readAny(['[data-qa*="engine"]']);
+    const fuel         = ddByLabels(["Fuel type","Fuel"]) || readAny(['[data-qa*="fuel"]']);
+    const vin          = ddByLabels(["VIN"])          || readAny(['[data-qa*="vin"]']);
+
+    let images = $$("img").map(i => i.currentSrc || i.src).filter(Boolean);
+    images = Array.from(new Set(images)).slice(0, 40);
+
+    return { source:"cars.com", title, year, make, model, trim, price, mileage,
+             exterior, interior, drivetrain, transmission, engine, fuel, vin, images };
+  }
+
+  function captureAT(){
+    const title = txt($("h1")) || txt($("[data-cmp='heading']"));
+    const price = toNum(txt($("[data-cmp='first-price'],[data-cmp='pricing']")));
+    const mileage = toNum(txt($("[data-cmp='mileage']")));
+    return { source:"autotrader", title, price, mileage };
+  }
+
+  function detectAndCapture(){
+    const h = location.hostname;
+    if (h.includes("cars.com")) return captureCars();
+    if (h.includes("autotrader.com")) return captureAT();
+    return { source:h, note:"no profile" };
+  }
+
+  /* ========== overlay (inline CSS; no external files) ========== */
+  function mountOverlay(){
+    if (document.getElementById("vp-shadow-host")) return;
+    const host = document.createElement("div"); host.id="vp-shadow-host";
+    document.documentElement.appendChild(host);
+    const shadow = host.attachShadow({mode:"open"});
+
+    const style = document.createElement("style");
+    style.textContent = `
+      :host, .vp-root { all: initial; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+      .vp-pill { position:fixed; right:18px; bottom:18px; z-index:2147483647; padding:10px 14px; border-radius:999px; background:#111; color:#fff; font-weight:600; box-shadow:0 8px 20px rgba(0,0,0,.25); cursor:pointer; user-select:none; }
+      .vp-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:2147483646; display:none; }
+      .vp-backdrop.open { display:block; }
+      .vp-modal { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:520px; max-height:78vh; overflow:auto; padding:18px; background:#fff; color:#111; border-radius:16px; z-index:2147483647; box-shadow:0 30px 80px rgba(0,0,0,.35); display:none; }
+      .vp-modal.open { display:block; }
+      .vp-hdr { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+      .vp-title { font-size:18px; font-weight:700; }
+      .vp-sub { font-size:12px; color:#666; }
+      .vp-rows { margin-top:6px; border-top:1px solid #eee; }
+      .vp-row { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid #f1f1f1; }
+      .vp-row b { color:#444; min-width:140px; }
+      .vp-actions { display:flex; gap:10px; margin-top:12px; }
+      .vp-btn { flex:1; padding:11px 12px; border-radius:10px; border:1px solid #e5e7eb; cursor:pointer; background:#111; color:#fff; font-weight:700; }
+      .vp-btn.secondary { background:#fff; color:#111; }
+      .vp-msg { font-size:12px; color:#666; margin-top:6px; }
+    `;
+    shadow.appendChild(style);
+
+    const root = document.createElement("div");
+    root.className = "vp-root";
+    root.innerHTML = `
+      <div class="vp-pill" id="vp-pill">Vehicle Tools</div>
+      <div class="vp-backdrop" id="vp-backdrop"></div>
+      <div class="vp-modal" id="vp-modal">
+        <div class="vp-hdr">
+          <div>
+            <div class="vp-title">Vehicle Preview</div>
+            <div class="vp-sub">source: <span id="vp-source">â€“</span></div>
+          </div>
+          <button class="vp-btn secondary" id="vp-close" style="flex:0 0 auto;padding:6px 10px;">Close</button>
+        </div>
+        <div class="vp-actions" style="margin-top:0">
+          <button class="vp-btn secondary" id="vp-scan">Scan Vehicle</button>
+          <button class="vp-btn" id="vp-send">Send to Bridge</button>
+        </div>
+        <div class="vp-rows" id="vp-rows"></div>
+        <div class="vp-msg" id="vp-msg"></div>
       </div>
-      <div id="vp-status">Checking Node bridgeâ€¦</div>
-    </div>`;
-  document.documentElement.appendChild(root);
-  const $=s=>root.querySelector(s);
-  const btn=$("#vp-pill"), panel=$("#vp-panel"), content=$("#vp-content");
-  const copyBtn=$("#vp-copy"), imgBtn=$("#vp-images"), sendBtn=$("#vp-send"), status=$("#vp-status");
+    `;
+    shadow.appendChild(root);
 
-  // --- helpers ---
-  const wait=(ms)=>new Promise(r=>setTimeout(r,ms));
-  const clean=s=>(s||"").replace(/\s+/g," ").trim();
-  const text=el=>clean(el?.textContent||"");
-  const num =raw=>{ if(raw==null) return null; const n=String(raw).replace(/[^\d]/g,""); return n? Number(n):null; };
-  const formatUSD=n=>{ try{return Number(n).toLocaleString("en-US",{style:"currency",currency:"USD",maximumFractionDigits:0})}catch{return n} };
-  const meta=name=>{ const m=document.querySelector(`meta[name="${name}"], meta[property="${name}"]`); return m?.content?.trim()||null; };
+    const pill  = shadow.getElementById("vp-pill");
+    const back  = shadow.getElementById("vp-backdrop");
+    const modal = shadow.getElementById("vp-modal");
+    const rows  = shadow.getElementById("vp-rows");
+    const send  = shadow.getElementById("vp-send");
+    const scan  = shadow.getElementById("vp-scan");
+    const close = shadow.getElementById("vp-close");
+    const msg   = shadow.getElementById("vp-msg");
+    const srcEl = shadow.getElementById("vp-source");
 
-  const normYear = (s)=>{
-    const m = String(s||"").match(/\b(19|20)\d{2}\b/);
-    if(!m) return null;
-    const y = Number(m[0]); return (y>=1981 && y<=2035)? y : null;
-  };
+    const open  = () => { modal.classList.add("open"); back.classList.add("open"); };
+    const closeFn= () => { modal.classList.remove("open"); back.classList.remove("open"); msg.textContent=""; };
+    pill.addEventListener("click", open); back.addEventListener("click", closeFn); close.addEventListener("click", closeFn);
 
-  const parseYMMT = (t)=>{
-    if(!t) return {};
-    t = clean(t.replace(/\|.*$/,"")); // drop "| Cars.com" etc.
-    // allow "New 2026 Chevrolet Trailblazer LT ..."
-    const m = t.match(/(?:^|\s)(?:New|Used)?\s*((?:19|20)\d{2})\s+([A-Za-z][A-Za-z\-]+)\s+([A-Za-z0-9][A-Za-z0-9\-]+)(?:\s+(.+))?/i);
-    if(!m) return { year: normYear(t) };
-    let trim = clean(m[4]||"");
-    // remove marketing tails from trim
-    trim = trim.replace(/\b(For Sale|with|at|priced?).*$/i,"")
-               .replace(/\$\d[\d,]*/g,"")
-               .replace(/\|.*$/,"")
-               .replace(/\s{2,}/g," ")
-               .trim();
-    if(!trim) trim = null;
-    return { year:Number(m[1]), make:m[2], model:m[3], trim };
-  };
-
-  // label-based getter
-  function getByLabel(labels){
-    labels = Array.isArray(labels)? labels : [labels];
-    const labRe = new RegExp("^\\s*(?:"+labels.map(l=>l.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|")+")\\s*$","i");
-    // dt/dd
-    for(const dt of document.querySelectorAll("dt,[role=term]")){
-      if(labRe.test(text(dt))){
-        const dd = dt.nextElementSibling?.matches?.("dd,[role=definition]")? dt.nextElementSibling : dt.parentElement?.querySelector("dd,[role=definition]");
-        const v = clean(text(dd)); if(v) return v;
-      }
+    let last = null;
+    function render(v){
+      srcEl.textContent = v.source || "â€“";
+      const entries = [
+        ["Title", v.title],["Year", v.year],["Make", v.make],["Model", v.model],["Trim", v.trim],
+        ["Price", v.price ? `$${v.price.toLocaleString()}` : ""],
+        ["Mileage", v.mileage ? `${v.mileage.toLocaleString()} mi` : ""],
+        ["Exterior", v.exterior],["Interior", v.interior],
+        ["Drivetrain", v.drivetrain],["Transmission", v.transmission],
+        ["Engine", v.engine],["Fuel", v.fuel],["VIN", v.vin],
+        ["Images", v.images?.length || 0]
+      ];
+      rows.innerHTML = entries.map(([k,val]) => `<div class="vp-row"><b>${k}</b><div>${val ?? ""}</div></div>`).join("");
     }
-    // generic two-column
-    for(const el of document.querySelectorAll("div,span,p,th,td,label")){
-      if(!labRe.test(text(el))) continue;
-      const sib = el.nextElementSibling && clean(text(el.nextElementSibling)) ? clean(text(el.nextElementSibling)) : null;
-      if(sib) return sib;
-      const row = el.closest("tr,li,div");
-      if(row){
-        const cand = Array.from(row.querySelectorAll("div,span,td")).map(text).find(v=>v && !labRe.test(v));
-        if(cand) return cand;
-      }
-    }
-    return null;
-  }
 
-  // price candidates (prefer labeled; ignore MSRP/finance; clamp range; choose sale price)
-  function collectPriceCandidates(){
-    const badCtx = /(\/mo|per month|monthly|apr|down|payment|doc fee|destination|mpg|mi\/kwh|range)/i;
-    const goodSel = [
-      "[data-testid*='price' i]","[data-qa*='price' i]",
-      "[id*='price' i]","[class*='price' i]",
-      ".vehicle-price",".listing-price",".price-section .primary-price"
-    ].join(",");
-    const out=[];
-    for(const el of document.querySelectorAll(goodSel)){
-      const t = text(el); if(!t || badCtx.test(t)) continue;
-      const isMSRP = /msrp/i.test(t);
-      const matches = t.match(/\$?\s?(\d{1,3}(?:,\d{3})+|\d{4,8})/g)||[];
-      for(const s of matches){
-        const n = Number(String(s).replace(/[^\d]/g,""));
-        if(n>=5000 && n<=200000) out.push({n, msrp:isMSRP, source:"labeled"});
-      }
-    }
-    // page fallback
-    const page = document.body.innerText;
-    (page.match(/\$?\s?(\d{1,3}(?:,\d{3})+|\d{4,8})/g)||[]).forEach(s=>{
-      const n = Number(String(s).replace(/[^\d]/g,""));
-      if(n>=5000 && n<=200000) out.push({n, msrp:false, source:"page"});
+    scan.addEventListener("click", () => {
+      last = detectAndCapture();
+      render(last);
+      msg.textContent = "Scanned âœ“";
     });
-    return out;
-  }
-  const findPriceSmart = (jsonLdPrice)=>{
-    if(jsonLdPrice && jsonLdPrice>=5000 && jsonLdPrice<=200000) return jsonLdPrice;
-    const c = collectPriceCandidates();
-    if(!c.length) return null;
-    const labeled = c.filter(x=>x.source==="labeled");
-    const nonMsrp = labeled.filter(x=>!x.msrp).map(x=>x.n);
-    if(nonMsrp.length) return Math.min(...nonMsrp);
-    if(labeled.length)  return Math.min(...labeled.map(x=>x.n));
-    return Math.min(...c.map(x=>x.n));
-  };
 
-  // mileage candidates (prefer labeled; allow "mi." ; exclude mpg/range)
-  function collectMileageCandidates(){
-    const badCtx = /(mpg|mi\/kwh|kwh|range|electric range|epa)/i;
-    const sel = [
-      "[data-testid*='mileage' i]","[data-qa*='mileage' i]",
-      "[id*='mileage' i]","[class*='mileage' i]",
-      "[data-testid*='odometer' i]","[id*='odometer' i]","[class*='odometer' i]"
-    ].join(",");
-    const out = [];
-    for(const el of document.querySelectorAll(sel)){
-      const t = text(el); if(!t || badCtx.test(t)) continue;
-      const m = t.match(/(\d[\d,\.]{0,9})\s*(?:mi|miles)\.?\b/i) || t.match(/^\s*(\d[\d,\.]{0,9})\s*$/i);
-      if(m){ const n = Number(String(m[1]).replace(/[^\d]/g,"")); if(n>=0 && n<=500000) out.push(n); }
-    }
-    // page fallback
-    const page = document.body.innerText;
-    (page.match(/\b(\d[\d,\.]{0,9})\s*(?:mi|miles)\.?\b/gi)||[])
-      .filter(s=>!badCtx.test(s))
-      .forEach(s=>{
-        const m = s.match(/(\d[\d,\.]{0,9})/);
-        if(m){ const n = Number(String(m[1]).replace(/[^\d]/g,"")); if(n>=0 && n<=500000) out.push(n); }
-      });
-    return out;
-  }
-  const findMileageSmart = (jsonLdMiles)=>{
-    if((jsonLdMiles??null)!=null) return Number(jsonLdMiles);
-    const c = collectMileageCandidates();
-    if(!c.length) return null;
-    // prefer the smallest labeled odometer for new cars (e.g., 3 mi) â€” but guard against 0 showing up wrongly
-    return Math.max(...c); // use max; in practice odometer is the largest "mi" figure on page
-  };
+    send.addEventListener("click", async () => {
+      try{
+        if (!last) { last = detectAndCapture(); render(last); }
+        msg.textContent = "Sendingâ€¦";
+        const res = await fetch("http://localhost:3323/capture", {
+          method:"POST", headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify(last)
+        });
+        msg.textContent = res.ok ? "âœ… Sent to Node bridge." : `âš ï¸ Bridge error ${res.status}`;
+      }catch(e){ msg.textContent = "âš ï¸ " + (e?.message||e) }
+    });
 
-  function bestFromSrcset(ss){
-    try{
-      const parts = (ss||"").split(",").map(s=>s.trim()).map(p=>{const [u,w]=p.split(/\s+/);return{url:u,w:Number((w||"").replace(/\D/g,""))||0};}).sort((a,b)=>b.w-a.w);
-      return parts[0]?.url || null;
-    }catch{return null;}
-  }
-  function collectImages(){
-    const set=new Set();
-    for(const img of document.querySelectorAll("img")){
-      const u = bestFromSrcset(img.getAttribute("srcset")) || img.currentSrc || img.src;
-      if(u && /(autotrader|cars\.com|dealer|images|cdn|cloudfront|akamaized|car|photo)/i.test(u)) set.add(u);
-    }
-    for(const el of document.querySelectorAll("[data-src],[data-lazy],[data-original]")){
-      const u = el.getAttribute("data-src") || el.getAttribute("data-lazy") || el.getAttribute("data-original");
-      if(u && /^https?:/i.test(u)) set.add(u);
-    }
-    return Array.from(set).slice(0,30);
-  }
-  async function expandAndScroll(){
-    Array.from(document.querySelectorAll("button,a,div[role='button']")).filter(el=>/show more|see more|view details|expand|full details|specs/i.test(el.innerText||"")).forEach(el=>{ try{ el.click(); }catch{} });
-    for(let y=0;y<Math.min(6000, document.body.scrollHeight+500); y+=800){ window.scrollTo({top:y,behavior:"instant"}); await wait(120); }
-    window.scrollTo({top:0,behavior:"instant"}); await wait(60);
+    // quick console helpers
+    window.__capturePrice   = getHeaderPrice;
+    window.__captureMileage = getHeaderMiles;
   }
 
-  function scrapeVehicle(){
-    const v={};
-    // JSON-LD Vehicle & Product
-    const lds = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s=>{try{return JSON.parse(s.textContent)}catch{return null}}).filter(Boolean);
-    const node = lds.find(x=>x && (x["@type"]==="Vehicle" || (Array.isArray(x["@type"]) && x["@type"].includes("Vehicle"))));
-    const prod = lds.find(x=>x && (x["@type"]==="Product" || (Array.isArray(x["@type"]) && x["@type"].includes("Product"))));
-    if(node){
-      v.year  = normYear(node.modelDate || node.productionDate || node.vehicleModelDate) || null;
-      v.make  = node.brand && (node.brand.name || node.brand) || null;
-      v.model = node.model || null;
-      v.trim  = node.trim || null;
-      if(node.mileageFromOdometer?.value) v.mileage = num(node.mileageFromOdometer.value);
-      v.vin   = node.vin || null;
-      v.exteriorColor = node.color || null;
-      v.transmission  = node.vehicleTransmission || null;
-      v.description   = node.description || null;
-      if(node.image) v.images = Array.isArray(node.image)? node.image : [node.image];
-    }
-    if(prod){
-      if(!v.year) v.year = normYear(prod.releaseDate) || normYear(prod.name) || null;
-      if(!v.images && prod.image){ const arr = Array.isArray(prod.image)? prod.image:[prod.image]; v.images = (v.images||[]).concat(arr); }
-    }
-
-    // VIN fallback
-    if(!v.vin){ const m = document.body.innerText.match(/\b([A-HJ-NPR-Z0-9]{17})\b/); if(m) v.vin = m[1]; }
-
-    // Title/meta fallback
-    const t = meta("og:title") || meta("twitter:title") || document.title || text(document.querySelector("h1,h2"));
-    const fromTitle = parseYMMT(t) || {};
-    v.year  = v.year  || fromTitle.year  || normYear(text(document.querySelector("h1,h2"))) || null;
-    v.make  = v.make  || fromTitle.make  || null;
-    v.model = v.model || fromTitle.model || null;
-    v.trim  = v.trim  || fromTitle.trim  || null;
-
-    // Labeled year
-    const yLab = normYear(getByLabel(["Model Year","Year"]));
-    v.year = v.year || yLab || null;
-
-    // Price & mileage
-    const jsonLdPrice = num(node?.offers?.price) || num(prod?.offers?.price) || null;
-    v.price   = findPriceSmart(jsonLdPrice);
-    v.mileage = (v.mileage ?? findMileageSmart(null));
-
-    // Other specs
-    v.exteriorColor = v.exteriorColor || getByLabel(["Exterior Color","Exterior color","Exterior"]);
-    v.interiorColor = v.interiorColor || getByLabel(["Interior Color","Interior color","Interior"]);
-    v.transmission  = v.transmission  || getByLabel(["Transmission"]);
-    v.engine        = v.engine        || getByLabel(["Engine"]);
-    v.drivetrain    = v.drivetrain    || getByLabel(["Drivetrain","Drive Type","Drive type"]);
-
-    // Description fallback
-    if(!v.description){
-      const long = Array.from(document.querySelectorAll("p,div")).map(text).filter(x=>x.length>180).sort((a,b)=>b.length-a.length)[0];
-      if(long) v.description = long;
-    }
-
-    // Images
-    const imgs = collectImages();
-    v.images = Array.from(new Set((v.images||[]).concat(imgs)));
-
-    return v;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", mountOverlay, {once:true});
+  } else {
+    mountOverlay();
   }
-
-  async function captureFlow(){
-    status.textContent="Preparing pageâ€¦";
-    await expandAndScroll();
-    const v = scrapeVehicle();
-
-    content.innerHTML="";
-    const rows=[
-      ["Year", v.year],["Make", v.make],["Model", v.model],["Trim", v.trim],
-      ["Price", v.price!=null?formatUSD(v.price):""],
-      ["Mileage", v.mileage!=null? Number(v.mileage).toLocaleString():""],
-      ["VIN", v.vin],["Exterior", v.exteriorColor],["Interior", v.interiorColor],
-      ["Transmission", v.transmission],["Engine", v.engine],["Drivetrain", v.drivetrain],
-      ["Images", (v.images||[]).length]
-    ];
-    for(const [k,val] of rows){
-      const r=document.createElement("div"); r.className="vp-row"; r.innerHTML=`<b>${k}</b><div>${val??""}</div>`; content.appendChild(r);
-    }
-    if(v.description){
-      const r=document.createElement("div"); r.className="vp-row"; r.style.gridTemplateColumns="1fr";
-      r.innerHTML=`<div><b>Description</b><div style="margin-top:4px;white-space:pre-wrap;">${v.description.replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]))}</div></div>`;
-      content.appendChild(r);
-    }
-    window.__vp_vehicle=v;
-    status.textContent="Ready âœ…";
-  }
-
-  async function ping(){ try{ const r=await fetch(BRIDGE+"/ping",{cache:"no-store"}); const j=await r.json(); status.textContent=j?.ok?"Bridge connected âœ…":"Bridge not responding"; return !!j?.ok; }catch{ status.textContent="Bridge not running âŒ â€” start Node project"; return false; } }
-  ping();
-
-  btn.addEventListener("click", async ()=>{ panel.classList.toggle("open"); if(panel.classList.contains("open")) await captureFlow(); });
-  $("#vp-copy").addEventListener("click", async ()=>{ try{ await navigator.clipboard.writeText(JSON.stringify(window.__vp_vehicle||{},null,2)); copyBtn.textContent="Copied âœ…"; setTimeout(()=>copyBtn.textContent="Copy JSON",1200);}catch(e){alert("Copy failed: "+e.message)}});
-  $("#vp-images").addEventListener("click", ()=>{ const urls=(window.__vp_vehicle?.images||[]).slice(0,30); if(!urls.length) return alert("No image URLs found."); urls.forEach((u,i)=>{ try{ chrome.downloads.download({ url:u, filename:`vehicle_photos/photo_${String(i+1).padStart(2,"0")}.jpg`, saveAs:false }); }catch{ window.open(u,"_blank"); } }); });
-  $("#vp-send").addEventListener("click", async ()=>{ if(!await ping()) return alert("Node bridge not running."); try{ const r=await fetch(BRIDGE+"/capture",{method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(window.__vp_vehicle||{})}); const j=await r.json(); if(j.ok){ sendBtn.textContent="Sent âœ…"; setTimeout(()=>sendBtn.textContent="Send to Node",1200);} else alert("Bridge error: "+(j.error||"unknown")); }catch(e){ alert("Failed to contact bridge: "+e.message); } });
 })();
-/* ===== PATCH: robust header price/mileage for Cars.com (and similar) ===== */
-(function(){
-  if (window.__mileagePricePatchApplied) return;
-  window.__mileagePricePatchApplied = true;
-
-  function captureHeaderPrice() {
-    try {
-      const nodes = Array.from(document.querySelectorAll("h1,h2,h3,[class*='price'],[data-test],body *")).slice(0,2000);
-      for (const el of nodes) {
-        const t = (el.textContent || "").replace(/\s+/g," ").trim();
-        const m = t.match(/\$\s?(\d{1,3}(?:,\d{3})+)/);
-        if (m) return Number(m[1].replace(/,/g,""));
-      }
-    } catch {}
-    return null;
-  }
-
-  function captureHeaderMiles() {
-    try {
-      const nodes = Array.from(document.querySelectorAll("h1,h2,h3,[class*='mileage'],[data-test],body *")).slice(0,2000);
-      for (const el of nodes) {
-        const t = (el.textContent || "").replace(/\s+/g," ").trim();
-        const m = t.match(/(\d{1,3}(?:,\d{3})+|\d{2,6})\s*(?:mi\.?|miles?)/i);
-        if (m) return Number(m[1].replace(/,/g,""));
-      }
-    } catch {}
-    return null;
-  }
-
-  // Expose for your scraper / DevTools
-  window.__captureMileage = captureHeaderMiles;
-  window.__capturePrice   = captureHeaderPrice;
-})();
-
-
-/* ===== PATCH: robust header price/mileage + bridge intercept ===== */
-(function(){
-  if (window.__vpMileagePricePatchApplied) return;  // prevent double-inject
-  window.__vpMileagePricePatchApplied = true;
-
-  function __vp_captureHeaderPrice() {
-    try {
-      const nodes = Array.from(document.querySelectorAll("h1,h2,h3,[class*='price'],[data-test],body *")).slice(0,2000);
-      for (const el of nodes) {
-        const t = (el.textContent || "").replace(/\s+/g," ").trim();
-        const m = t.match(/\$\s?(\d{1,3}(?:,\d{3})+)/);
-        if (m) return Number(m[1].replace(/,/g,""));
-      }
-    } catch {}
-    return null;
-  }
-
-  function __vp_captureHeaderMiles() {
-    try {
-      const nodes = Array.from(document.querySelectorAll("h1,h2,h3,[class*='mileage'],[data-test],body *")).slice(0,2000);
-      for (const el of nodes) {
-        const t = (el.textContent || "").replace(/\s+/g," ").trim();
-        const m = t.match(/(\d{1,3}(?:,\d{3})+|\d{2,6})\s*(?:mi\.?|miles?)/i);
-        if (m) return Number(m[1].replace(/,/g,""));
-      }
-    } catch {}
-    return null;
-  }
-
-  // expose for console testing
-  window.__capturePrice   = __vp_captureHeaderPrice;
-  window.__captureMileage = __vp_captureHeaderMiles;
-
-  // intercept POST /capture going to the Node bridge and fix payload
-  const _origFetch = window.fetch;
-  window.fetch = async function(input, init) {
-    try {
-      const url = (typeof input === "string") ? input : (input?.url || "");
-      const isCapture = /\/capture(\?|$)/i.test(url);
-      const isPost = (init?.method || "GET").toUpperCase() === "POST";
-
-      if (isCapture && isPost && init?.body) {
-        let bodyText = init.body;
-        // handle BodyInit variants
-        if (bodyText && typeof bodyText !== "string") {
-          try { bodyText = await (new Response(bodyText)).text(); } catch { bodyText = String(bodyText) }
-        }
-        try {
-          const data = JSON.parse(bodyText || "{}");
-          const hp = __vp_captureHeaderPrice();
-          const hm = __vp_captureHeaderMiles();
-          if (Number.isFinite(hp)) data.price = hp;
-          if (Number.isFinite(hm)) data.mileage = hm;
-          init.body = JSON.stringify(data);
-          // optional: also mirror to a debug window var
-          window.__vp_lastPatchedPayload = data;
-          console.debug("[VP] Patched payload ?", { price: data.price, mileage: data.mileage });
-        } catch (e) {
-          console.debug("[VP] payload patch skipped:", e?.message || e);
-        }
-      }
-    } catch {}
-    return _origFetch.apply(this, arguments);
-  };
-})();
-

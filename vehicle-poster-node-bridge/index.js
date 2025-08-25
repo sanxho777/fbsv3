@@ -1,4 +1,5 @@
-﻿import "dotenv/config";
+// index.js
+import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import express from "express";
@@ -7,8 +8,11 @@ import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import inquirer from "inquirer";
 import { fileURLToPath } from "url";
-import { titleFromParts, roundedMileage, defaultDescription, parseMiles } from "./utils/formatter.js";
+
+import { titleFromParts, defaultDescription, parseMiles } from "./utils/formatter.js";
 import { downloadImages, ensureDir } from "./utils/imageDownloader.js";
+import { normalizeColor } from "./utils/colorMap.js";      // maps Slate -> Gray, etc.
+import { normalizeColors } from "./utils/normalize.js";     // flattens extension keys
 
 puppeteer.use(StealthPlugin());
 
@@ -18,62 +22,114 @@ const __dirname  = path.dirname(__filename);
 const {
   FACEBOOK_EMAIL,
   FACEBOOK_PASSWORD,
-  USER_DATA_DIR = path.join(__dirname,".chrome-profile"),
+  USER_DATA_DIR = path.join(__dirname, ".chrome-profile"),
   CHROME_EXECUTABLE,
-  USER_AGENT = process.env.USER_AGENT || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  PORT = 5566,
+  USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  PORT = "3233",                                 // 👈 default to 3233
   FB_LOGIN_MAX_WAIT_MS = 10 * 60 * 1000,
   FB_LOGIN_POLL_MS     = 1500,
   FB_MARKETPLACE_MAX_WAIT_MS = 120000,
   DEBUG_SHOTS_DIR = "",
-  FORCE_VEHICLE_TYPE = process.env.FORCE_VEHICLE_TYPE || "Car/van",
-  WAIT_FOR_ENTER = process.env.WAIT_FOR_ENTER || "1"
+  FORCE_VEHICLE_TYPE = "Car/van",
+  WAIT_FOR_ENTER = "1"
 } = process.env;
 
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+// ------------------------------- utils -------------------------------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const dbg = async (page, name) => {
   if (!DEBUG_SHOTS_DIR) return;
   try {
     await ensureDir(DEBUG_SHOTS_DIR);
     const file = path.join(DEBUG_SHOTS_DIR, `${Date.now()}_${name}.png`);
-    await page.screenshot({ path:file, fullPage:false });
-    console.log("", file);
+    await page.screenshot({ path: file, fullPage: false });
+    console.log(file);
   } catch {}
 };
+const norm = (s) => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+const uniq = (arr) => [...new Set(arr.filter(Boolean).map(s => String(s).trim()))];
 
-async function waitForEnter(message = "Clear any popups and press Enter to autofill") {
-  if (String(WAIT_FOR_ENTER) !== "1") return;
-  console.log(`\\n  ${message}`);
-  await inquirer.prompt([{ type: "input", name: "go", message: "Press Enter to continue" }]);
+// Locale-aware candidate builders
+function colorCandidates(raw){
+  const s = String(raw || "");
+  const base = normalizeColor(s); // our normalized label (e.g., “Gray”)
+  const cands = [s, base];
+
+  // grey family synonyms
+  if (/slate|graphite|charcoal|gunmetal|grey|gray/i.test(s) || /gray/i.test(base)) {
+    cands.push("Grey","Gray","Slate");
+  }
+  // common colours — ensure we try the exact normalized word too
+  const common = ["Black","White","Silver","Blue","Red","Brown","Beige","Green","Gold","Yellow","Orange","Purple"];
+  if (common.includes(base)) cands.push(base);
+
+  return uniq(cands);
+}
+function fuelCandidates(v){
+  // infer from description/engine; then add locale synonyms
+  const text = `${v.engine||""} ${v.description||""}`.toLowerCase();
+  let inferred = "Gasoline";
+  if (/electric|ev|kwh|kilowatt/.test(text)) inferred = "Electric";
+  else if (/hybrid|hev|plug-?in|phev/.test(text)) inferred = "Hybrid";
+  else if (/diesel|tdi|duramax|cummins/.test(text)) inferred = "Diesel";
+
+  const c = [inferred];
+  if (/gas/i.test(inferred) || inferred === "Gasoline") c.push("Petrol","Gas","Gasoline");
+  if (inferred === "Diesel")   c.push("Diesel");
+  if (inferred === "Hybrid")   c.push("Hybrid");
+  if (inferred === "Electric") c.push("Electric");
+  return uniq(c);
+}
+function inferBodyStyle(v){
+  const m = `${v.make||""} ${v.model||""} ${v.trim||""}`.toLowerCase();
+  if (/truck|pickup|f-?150|silverado|ram|tundra|sierra|tacoma/.test(m)) return "Truck";
+  if (/van|minivan|transit|sienna|odyssey|caravan|pacifica|sprinter|promaster/.test(m)) return "Van";
+  if (/coupe|mustang|challenger|camaro|brz|86|supra/.test(m)) return "Coupe";
+  if (/convertible|roadster|spider|spyder|cabrio/.test(m)) return "Convertible";
+  if (/hatch|golf|fit|yaris|versa|impreza hatch/.test(m)) return "Hatchback";
+  if (/wagon|outback|allroad/.test(m)) return "Wagon";
+  if (/suv|trailblazer|equinox|tahoe|suburban|escape|rav4|cr-?v|pilot|highlander|explorer|blazer|cx-|nx|rx|gv|x[3-7]|gl|telluride|seltos|palisa/i.test(m)) return "SUV";
+  return "Sedan";
+}
+function inferTransmission(v){
+  const t = `${v.transmission||""}`.toLowerCase();
+  if (/manual|mt/.test(t)) return "Manual transmission";
+  if (/cvt/.test(t)) return "CVT";
+  return "Automatic transmission";
+}
+function conditionLabel(miles){
+  const n = parseMiles(miles) ?? 0;
+  return n>0 && n<30000 ? "Used – Like New" : "Used – Good";
 }
 
+// ---------------------- puppeteer: browser & login -------------------
 let browser;
 async function getBrowser(){
   if (browser) return browser;
   await ensureDir(USER_DATA_DIR);
   browser = await puppeteer.launch({
-    headless:false,
+    headless: false,
     executablePath: CHROME_EXECUTABLE || undefined,
-    args:[
+    args: [
       `--user-data-dir=${USER_DATA_DIR}`,
-      "--no-sandbox","--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled","--lang=en-US,en"
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
+      "--lang=en-US,en"
     ]
   });
   return browser;
 }
 
-/** Login + checkpoint wait */
 async function ensureFacebookReady(page){
   const maxWait = Number(FB_LOGIN_MAX_WAIT_MS) || (10*60*1000);
   const poll    = Number(FB_LOGIN_POLL_MS) || 1500;
 
-  console.log(" Opening Facebook");
-  await page.goto("https://www.facebook.com/", { waitUntil:"domcontentloaded" });
+  console.log("Opening Facebook…");
+  await page.goto("https://www.facebook.com/", { waitUntil: "domcontentloaded" });
 
   if (await page.$('input[name="email"]')) {
     if (FACEBOOK_EMAIL && FACEBOOK_PASSWORD) {
-      console.log(" Filling credentials");
+      console.log("Filling credentials…");
       await page.type('input[name="email"]', FACEBOOK_EMAIL, {delay:20});
       await page.type('input[name="pass"]',  FACEBOOK_PASSWORD, {delay:20});
       await Promise.all([
@@ -81,7 +137,7 @@ async function ensureFacebookReady(page){
         page.waitForNavigation({waitUntil:"domcontentloaded", timeout:60000}).catch(()=>{})
       ]);
     } else {
-      console.log(" On login page. Please sign in manually in the window.");
+      console.log("On login page. Please sign in manually.");
     }
   }
 
@@ -89,10 +145,10 @@ async function ensureFacebookReady(page){
   let lastUrl = "";
   while (Date.now() - start < maxWait) {
     const url = page.url();
-    if (url !== lastUrl) { lastUrl = url; console.log("… FB at", url); }
+    if (url !== lastUrl) { lastUrl = url; console.log("FB at", url); }
 
     const isCheckpoint = /facebook\.com\/.*(checkpoint|two_factor|login\/checkpoint|device-based|save-device)/i.test(url);
-    if (isCheckpoint) console.log(" Login verification detected  complete it in the browser. Ill wait");
+    if (isCheckpoint) console.log("Login verification detected — complete it in the browser. I’ll wait.");
 
     const cookies = await page.cookies().catch(()=>[]);
     const hasSession = cookies.some(c => c.name === "c_user" && c.value);
@@ -101,15 +157,15 @@ async function ensureFacebookReady(page){
     }).catch(()=>false);
 
     if (hasSession && isLoggedInUI && !isCheckpoint) {
-      console.log("✅ Facebook session ready.");
+      console.log("Facebook session ready.");
       return true;
     }
     await sleep(poll);
   }
-  throw new Error("Timed out waiting for Facebook login/verification to complete.");
+  throw new Error("Timed out waiting for Facebook login/verification.");
 }
 
-/** Click helper */
+// ---------------------- page helpers (fb form) -----------------------
 async function clickByText(page, selectors, pattern, waitAfter=600){
   const sel = Array.isArray(selectors) ? selectors.join(",") : String(selectors);
   const re  = pattern instanceof RegExp ? pattern : new RegExp(pattern, "i");
@@ -125,7 +181,6 @@ async function clickByText(page, selectors, pattern, waitAfter=600){
   return false;
 }
 
-/** Ensure create flow is visible */
 async function ensureMarketplaceLanding(page){
   const maxWait = Number(FB_MARKETPLACE_MAX_WAIT_MS) || 120000;
   const start = Date.now();
@@ -148,27 +203,24 @@ async function ensureMarketplaceLanding(page){
   throw new Error("Marketplace first step did not load in time.");
 }
 
-const norm = (s) => String(s ?? "").toLowerCase().replace(/\s+/g," ").trim();
-
-/** Scoped combobox select */
 async function selectComboByLabel(page, labelRegex, value){
   if (value === undefined || value === null || value === "") return false;
   const re = labelRegex instanceof RegExp ? labelRegex : new RegExp(labelRegex, "i");
 
-  const combos = await page.$$('[role="combobox"], label[role="combobox"], div[role="combobox"]');
+  const combos = await page.$$('[role="combobox"], div[role="combobox"], label[role="combobox"]');
   for (const h of combos) {
     const isMatch = await page.evaluate((el, reSrc)=>{
       const re = new RegExp(reSrc, "i");
-      const t  = (el.innerText || el.textContent || "").trim();
+      const self = (el.innerText || el.textContent || "").trim();
       const near = (el.closest("label")?.innerText || el.parentElement?.innerText || "").trim();
-      return re.test(t) || re.test(near);
+      return re.test(self) || re.test(near);
     }, h, re.source);
     if (!isMatch) continue;
 
     await h.click().catch(()=>{});
-    await sleep(250);
+    await sleep(200);
 
-    await page.waitForSelector('[role="listbox"], [role="menu"], [role="dialog"]', {timeout:3000}).catch(()=>{});
+    await page.waitForSelector('[role="listbox"], [role="menu"], [role="dialog"]', { timeout: 3000 }).catch(()=>{});
     const options = await page.$$('div[role="listbox"] [role="option"], [role="menu"] [role="menuitem"], [role="listbox"] span');
 
     const target = norm(value);
@@ -186,31 +238,37 @@ async function selectComboByLabel(page, labelRegex, value){
         'div[role="listbox"] input[type="search"]:not([aria-label*="Facebook"])',
         'div[role="dialog"]  input[type="search"]:not([aria-label*="Facebook"])'
       ].join(',');
-      const sv = String(value);
       const search = await page.$(searchSel);
       if (search) {
         await search.focus().catch(()=>{});
         await page.evaluate(el => { el.value=""; }, search).catch(()=>{});
-        await page.type(searchSel, sv, {delay:12}).catch(()=>{});
+        await page.type(searchSel, String(value), {delay:12}).catch(()=>{});
         await page.keyboard.press("Enter").catch(()=>{});
       } else {
-        await page.keyboard.type(sv, {delay:12}).catch(()=>{});
+        await page.keyboard.type(String(value), {delay:12}).catch(()=>{});
         await page.keyboard.press("Enter").catch(()=>{});
       }
       clicked = true;
     }
 
+    // Guard: if FB navigated away (search results), go back
     if (!/facebook\.com\/marketplace\/.*create/i.test(page.url())) {
-      console.log(" Detected navigation out of create flow  returning");
       await page.goBack({waitUntil:"domcontentloaded"}).catch(()=>{});
-      await sleep(800);
+      await sleep(600);
     }
     return true;
   }
   return false;
 }
+async function selectComboFromList(page, labelRegex, values){
+  for (const v of values) {
+    if (!v) continue;
+    const ok = await selectComboByLabel(page, labelRegex, v);
+    if (ok) return true;
+  }
+  return false;
+}
 
-/** React-safe writer */
 async function setEditable(page, handle, value){
   await handle.focus().catch(()=>{});
   await page.evaluate((el, val)=>{
@@ -232,8 +290,6 @@ async function setEditable(page, handle, value){
     }
   }, handle, value);
 }
-
-/** Fill by nearby label */
 async function fillByLabel(page, labels, value, pressEnter=false){
   if (value==null || value==="") return false;
   const labelSet = (Array.isArray(labels)?labels:[labels]).map(s=>s.toLowerCase());
@@ -260,7 +316,6 @@ async function fillByLabel(page, labels, value, pressEnter=false){
   }
   return false;
 }
-
 async function setCheckboxByLabel(page, labelPattern, checked=true){
   const re = labelPattern instanceof RegExp ? labelPattern : new RegExp(labelPattern, "i");
   const nodes = await page.$$('label, div, span');
@@ -284,7 +339,6 @@ async function setCheckboxByLabel(page, labelPattern, checked=true){
   }
   return false;
 }
-
 async function clickNextWhenEnabled(page){
   for (let i=0;i<14;i++){
     const btns = await page.$$('div[role="button"], button');
@@ -305,38 +359,13 @@ async function clickNextWhenEnabled(page){
   }
   return false;
 }
+async function waitForEnter(message = "Close any popups, then press Enter to autofill"){
+  if (String(WAIT_FOR_ENTER) !== "1") return;
+  console.log(`\n  ${message}`);
+  await inquirer.prompt([{ type: "input", name: "go", message: "Press Enter to continue" }]);
+}
 
-/** Inference helpers */
-const inferBodyStyle = (v)=>{
-  const m = `${v.make||""} ${v.model||""} ${v.trim||""}`.toLowerCase();
-  if (/truck|pickup|f-?150|silverado|ram|tundra|sierra|tacoma/.test(m)) return "Truck";
-  if (/van|minivan|transit|sienna|odyssey|caravan|pacifica|sprinter|promaster/.test(m)) return "Van";
-  if (/coupe|mustang|challenger|camaro|brz|86|supra/.test(m)) return "Coupe";
-  if (/convertible|roadster|spider|spyder|cabrio/.test(m)) return "Convertible";
-  if (/hatch|golf|fit|yaris|versa|impreza hatch/.test(m)) return "Hatchback";
-  if (/wagon|outback|allroad/.test(m)) return "Wagon";
-  if (/suv|trailblazer|equinox|tahoe|suburban|escape|rav4|cr-?v|pilot|highlander|explorer|blazer|cx-|nx|rx|gv|x[3-7]|gl|telluride|seltos|palisa/i.test(m)) return "SUV";
-  return "Sedan";
-};
-const inferFuel = (v)=>{
-  const e = `${v.engine||""} ${v.description||""}`.toLowerCase();
-  if (/electric|ev|kilowatt|kwh/.test(e)) return "Electric";
-  if (/hybrid|hev|plugin|plug-in|phev/.test(e)) return "Hybrid";
-  if (/diesel|tdi|duramax|cummins/.test(e)) return "Diesel";
-  return "Gasoline";
-};
-const inferTransmission = (v)=>{
-  const t = `${v.transmission||""}`.toLowerCase();
-  if (/manual|mt/.test(t)) return "Manual transmission";
-  if (/cvt/.test(t)) return "CVT";
-  return "Automatic transmission";
-};
-const conditionLabel = (miles)=>{
-  const n = parseMiles(miles) ?? 0;
-  return n>0 && n<30000 ? "Used  Like New" : "Used  Good";
-};
-
-/** MAIN */
+// ------------------------------ main fill ----------------------------
 async function openFacebookAndFill(vehicle, imagePaths){
   const b = await getBrowser();
   const page = await b.newPage();
@@ -346,32 +375,41 @@ async function openFacebookAndFill(vehicle, imagePaths){
 
   await ensureFacebookReady(page);
 
-  console.log(" Opening Marketplace vehicle form");
+  console.log("Opening Marketplace vehicle form");
   await page.goto("https://www.facebook.com/marketplace/create/vehicle", { waitUntil:"domcontentloaded" });
   await ensureMarketplaceLanding(page);
 
   await waitForEnter("On the 'Create vehicle' page. Close any popups, then press Enter to begin.");
   await dbg(page, "step1-loaded");
 
-  // Step 1: Car/van + Year + Make/Model + Mileage + Price
+  // Combos: Vehicle type, Year, Make
   await selectComboByLabel(page, /vehicle type/, FORCE_VEHICLE_TYPE);
-  await selectComboByLabel(page, /^year\b/i, vehicle.year);
-  await selectComboByLabel(page, /^make\b/i, vehicle.make);
-  await selectComboByLabel(page, /^model\b/i, vehicle.model);
-  await fillByLabel(page, ["mileage","odometer"], roundedMileage(vehicle.mileage));
-  await fillByLabel(page, ["price"], vehicle.price);
+  await selectComboByLabel(page, /^year\b/i,  vehicle.year);
+  await selectComboByLabel(page, /^make\b/i,  vehicle.make);
+
+  // Text fields: Model, Mileage (exact), Price
+  await fillByLabel(page, ["model"],  vehicle.model);
+  const exactMiles = parseMiles(vehicle.mileage) ?? vehicle.mileage;
+  await fillByLabel(page, ["mileage","odometer"], exactMiles);
+  await fillByLabel(page, ["price"],  vehicle.price);
 
   // Appearance & details
-  await selectComboByLabel(page, /body style|bodytype/, inferBodyStyle(vehicle), "bodyStyle");
-  const ex = normalizeColor(vehicle.exteriorColor || "");   // colors: combo then fallback text
-  const inC = vehicle.interiorColor || "";
-  await selectComboByLabel(page, /exterior colou?r/, ex) || await fillByLabel(page, ["exterior colour","exterior color","exterior"], ex);
-  await selectComboByLabel(page, /interior colou?r/, inC) || await fillByLabel(page, ["interior colour","interior color","interior"], inC);
+  await selectComboByLabel(page, /body style|bodytype/, inferBodyStyle(vehicle));
+
+  // Colours with synonyms (Grey/Gray/Slate etc.)
+  const interiorNorm = normalizeColor(vehicle.interiorColor || "");
+  await selectComboFromList(page, /exterior colou?r/, colorCandidates(vehicle.exteriorColor))
+    || await fillByLabel(page, ["exterior colour","exterior color","exterior"], normalizeColor(vehicle.exteriorColor||""));
+  await selectComboByLabel(page, /interior colou?r/, interiorNorm)
+    || await fillByLabel(page, ["interior colour","interior color","interior"], interiorNorm);
 
   await setCheckboxByLabel(page, /clean title/, true);
-  await selectComboByLabel(page, /vehicle condition|condition/, conditionLabel(vehicle.mileage));
-  await selectComboByLabel(page, /fuel type|fuel/, inferFuel(vehicle), "fuel");
-  await selectComboByLabel(page, /transmission/, inferTransmission(vehicle), "transmission");
+  await selectComboByLabel(page, /vehicle condition|condition/, conditionLabel(exactMiles));
+
+  // Fuel type with Petrol/Gas/Gasoline tolerance
+  await selectComboFromList(page, /fuel type|fuel/, fuelCandidates(vehicle));
+
+  await selectComboByLabel(page, /transmission/, inferTransmission(vehicle));
 
   await clickNextWhenEnabled(page);
   await sleep(900);
@@ -382,7 +420,7 @@ async function openFacebookAndFill(vehicle, imagePaths){
   const desc = (vehicle.description || defaultDescription(vehicle)).slice(0,9700);
   await fillByLabel(page, ["description","details","about"], desc);
 
-  // Photos: try all file inputs
+  // Photos
   try{
     const fileInputs = await page.$$('input[type="file"]');
     if (fileInputs.length && (imagePaths?.length)) {
@@ -397,17 +435,22 @@ async function openFacebookAndFill(vehicle, imagePaths){
   }catch{}
 
   await dbg(page, "after-fill");
-  console.log("\\n Autofill complete. Review and click Post.");
+  console.log("\nAutofill complete. Review and click Post.");
 }
 
+// ------------------------------ server -------------------------------
 let busy=false;
 async function handleCapture(payload){
   if(busy) return { ok:false, error:"busy" };
   busy=true;
   try{
+    // Normalize aliases coming from extension
+    payload = normalizeColors(payload || {});
+
     await fs.promises.writeFile(path.join(__dirname,"data","vehicle.json"), JSON.stringify(payload,null,2));
     const images = await downloadImages(payload.images||[], path.join(__dirname,"images"));
-    console.log("\\n Vehicle:");
+
+    console.log("\nVehicle:");
     console.table({
       Year: payload.year, Make: payload.make, Model: payload.model, Trim: payload.trim,
       Price: payload.price, Mileage: payload.mileage, VIN: payload.vin,
@@ -415,14 +458,16 @@ async function handleCapture(payload){
       Transmission: payload.transmission, Engine: payload.engine, Drivetrain: payload.drivetrain,
       Images: images.length
     });
+
     const { proceed } = await inquirer.prompt([{ type:"confirm", name:"proceed", message:"Open Facebook and autofill?", default:true }]);
     if(!proceed) return { ok:true, skipped:true };
+
     await openFacebookAndFill(payload, images);
     return { ok:true };
   }catch(e){
     console.error("Bridge error:", e);
     return { ok:false, error:String(e.message||e) };
-  }finally{ busy:false; }
+  }finally{ busy=false; }
 }
 
 const app = express();
@@ -430,5 +475,7 @@ app.use(cors());
 app.use(express.json({limit:"2mb"}));
 app.get("/ping", (req,res)=>res.json({ok:true}));
 app.post("/capture", async (req,res)=> res.json(await handleCapture(req.body||{})));
-app.listen(Number(PORT)||5566, ()=> console.log(`\\n Node bridge on http://127.0.0.1:${PORT||5566}\\n`));
 
+app.listen(Number(PORT)||3233, ()=> {
+  console.log(`\nNode bridge on http://127.0.0.1:${PORT||3233}\n`);
+});

@@ -1,22 +1,23 @@
-{
+﻿{
+  "name": "Vehicle Poster Extension",
+  "version": "1.0.4",
   "manifest_version": 3,
-  "name": "Vehicle Poster Overlay (to Node Bridge)",
-  "version": "1.0.2",
-  "description": "Overlay on AutoTrader/Cars.com that sends vehicle data to a local Node bridge for FB autofill.",
-  "permissions": ["storage", "downloads", "activeTab", "scripting"],
+  "description": "Overlay + capture for Cars.com and Autotrader.",
+  "action": { "default_title": "Vehicle Poster" },
   "host_permissions": [
-    "*://*.autotrader.com/*",
     "*://*.cars.com/*",
-    "http://127.0.0.1/*",
-    "http://localhost/*"
+    "*://*.autotrader.com/*"
   ],
   "content_scripts": [
     {
-      "matches": ["*://*.autotrader.com/*", "*://*.cars.com/*"],
+      "matches": [
+        "https://*.cars.com/*",
+        "http://*.cars.com/*",
+        "https://*.autotrader.com/*",
+        "http://*.autotrader.com/*"
+      ],
       "js": ["content/capture.js"],
-      "css": ["content/overlay.css"],
       "run_at": "document_idle"
     }
-  ],
-  "icons": { "16":"assets/icon16.png","48":"assets/icon48.png","128":"assets/icon128.png" }
+  ]
 }
