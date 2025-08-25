@@ -1,0 +1,11 @@
+#vp-root{position:fixed;right:16px;bottom:16px;z-index:2147483647;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+#vp-pill{background:#111827;color:#fff;border:none;padding:10px 14px;border-radius:999px;box-shadow:0 10px 22px rgba(0,0,0,.25);cursor:pointer;font-weight:700}
+#vp-panel{position:fixed;right:16px;bottom:64px;width:380px;max-height:70vh;overflow:auto;background:#fff;border-radius:14px;padding:12px;box-shadow:0 16px 40px rgba(0,0,0,.25);display:none}
+#vp-panel.open{display:block}
+#vp-panel h2{margin:0 0 8px;font-size:16px}
+#vp-panel .vp-row{display:grid;grid-template-columns:120px 1fr;gap:6px;font-size:12px;padding:4px 0;border-bottom:1px solid #f0f0f0}
+#vp-panel .vp-row b{color:#374151}
+#vp-panel .vp-actions{display:flex;gap:8px;margin-top:10px}
+#vp-panel .vp-actions button{flex:1;padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#f9fafb;cursor:pointer;font-weight:600}
+#vp-panel .vp-actions button.primary{background:#2563eb;color:#fff;border-color:#1d4ed8}
+#vp-status{font-size:11px;color:#6b7280;margin-top:6px}
